@@ -2,7 +2,7 @@
 // @name         Steam Market Show Owned Items
 // @name:zh-CN   Steam市场显示已拥有物品
 // @namespace    https://steamcommunity.com/
-// @version      1.0.0
+// @version      1.0.1
 // @description       Automatically checks your Steam inventory and shows owned item counts (red [xN]) while browsing the Community Market.
 // @description:zh-CN 在Steam市场页面，已拥有的物品将在名称前显示库存中的数量。
 // @author       WorkBuddy
@@ -19,14 +19,14 @@
 
     // ==================== Configuration ====================
     var CFG = {
-        REQUEST_DELAY: 1500,
-        CACHE_DURATION: 10 * 60 * 1000,
+        REQUEST_DELAY: 600,
+        CACHE_DURATION: 30 * 60 * 1000,
         INVENTORY_COUNT: 2000,
         FALLBACK_COUNT: 1000,
         CONTEXT_ID: '2',
         LABEL_COLOR: '#d32f2f',
         RETRY_MAX: 2,
-        RETRY_DELAY: 2000,
+        RETRY_DELAY: 800,
     };
     /** Per-game inventory context overrides (Steam default context=2, some games differ) */
     var APP_CONTEXT = {
@@ -47,6 +47,95 @@
     var processing = false;
     var seen = new WeakSet();
     var observer = null;
+
+    // ==================== Persistent Cache ====================
+    /** localStorage key prefix — one entry per Steam ID */
+    var STORAGE_PREFIX = 'steam_owned_cache_';
+    /** sessionStorage key — survives page refresh, auto-cleared on browser close */
+    var SESSION_KEY = 'steam_owned_sess';
+    /** Debounce timer for localStorage writes */
+    var saveTimer = null;
+
+    /**
+     * Detect fresh browser session via sessionStorage.
+     * sessionStorage is cleared when the browser process closes,
+     * so absence means the browser was restarted → cache is stale, clear it.
+     * Unlike cookies, sessionStorage never interferes with HTTP redirects.
+     */
+    function isFreshSession() {
+        try { return sessionStorage.getItem(SESSION_KEY) === null; }
+        catch(e) { return true; }
+    }
+
+    /** Mark session as active (survives refresh, cleared on browser close) */
+    function markSession() {
+        try { sessionStorage.setItem(SESSION_KEY, '1'); } catch(e) {}
+    }
+
+    /** Load persisted cache from localStorage for the given Steam ID */
+    function loadPersistedCache(sid) {
+        try {
+            var raw = localStorage.getItem(STORAGE_PREFIX + sid);
+            if (!raw) return {};
+            var obj = JSON.parse(raw);
+            var restored = {};
+            for (var key in obj) {
+                if (obj[key] && Array.isArray(obj[key].data)) {
+                    restored[key] = { ts: obj[key].ts, data: new Map(obj[key].data) };
+                }
+            }
+            L('Loaded persisted cache: ' + Object.keys(restored).length + ' entries');
+            return restored;
+        } catch(e) {
+            L('Failed to load persisted cache: ' + e.message);
+            return {};
+        }
+    }
+
+    /** Save current cache to localStorage (debounced 200ms to avoid excessive writes) */
+    function savePersistedCache(sid) {
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = setTimeout(function() {
+            try {
+                var obj = {};
+                for (var key in cache) {
+                    if (cache[key] && cache[key].data instanceof Map) {
+                        obj[key] = {
+                            ts: cache[key].ts,
+                            data: Array.from(cache[key].data.entries())
+                        };
+                    }
+                }
+                localStorage.setItem(STORAGE_PREFIX + sid, JSON.stringify(obj));
+            } catch(e) {
+                L('Failed to persist cache: ' + e.message);
+            }
+            saveTimer = null;
+        }, 200);
+    }
+
+    /** Clear persisted cache for the given Steam ID */
+    function clearPersistedCache(sid) {
+        try { localStorage.removeItem(STORAGE_PREFIX + sid); } catch(e) {}
+    }
+
+    /** Write to in-memory cache and trigger persisted save */
+    function writeCache(key, data, sid) {
+        cache[key] = { ts: Date.now(), data: data };
+        if (sid) savePersistedCache(sid);
+    }
+
+    /** Load persisted cache or clear stale cache on fresh browser session */
+    function loadCacheForSession(sid) {
+        if (isFreshSession()) {
+            L('Fresh browser session, clearing stale cache');
+            clearPersistedCache(sid);
+            markSession();
+        } else {
+            cache = loadPersistedCache(sid);
+            L('Same browser session, restored cache from storage');
+        }
+    }
 
     // ==================== Get Steam ID ====================
     function getSteamID() {
@@ -110,22 +199,8 @@
     function parseInventoryData(data, appid) {
         var owned = new Map();
 
-        // Diagnostic: log top-level response fields
-        var topKeys = Object.keys(data).filter(function(k) {
-            return k !== 'descriptions' && k !== 'assets' && k !== 'rgInventory' && k !== 'rgDescriptions';
-        });
-        L('Response top-level fields: ' + topKeys.join(', '));
-        if (data.total_inventory_count !== undefined) {
-            L('total_inventory_count=' + data.total_inventory_count + ', success=' + data.success +
-              ', more_items=' + (data.more_items || 0) + ', last_assetid=' + (data.last_assetid || 'none'));
-        }
-
         // Try new format first (assets / descriptions arrays)
         if (Array.isArray(data.assets) && data.assets.length > 0 && Array.isArray(data.descriptions)) {
-            L('Detected assets/descriptions array format, assets=' + data.assets.length +
-              ', descriptions=' + data.descriptions.length);
-
-            // Build classid_instanceid -> description index
             var descMap = {};
             data.descriptions.forEach(function(d) {
                 var dk = d.classid + '_' + (d.instanceid || '0');
@@ -150,8 +225,6 @@
         var rgDesc = data.rgDescriptions;
         if (owned.size === 0 && rgInv && rgDesc) {
             var invKeys = Object.keys(rgInv);
-            L('Trying rgInventory/rgDescriptions object format, invKeys=' + invKeys.length +
-              ', descKeys=' + Object.keys(rgDesc).length);
 
             invKeys.forEach(function(id) {
                 var item = rgInv[id];
@@ -166,20 +239,6 @@
                 }
             });
         }
-
-        // Diagnostic: log first 5 inventory item name samples
-        var samples = [];
-        var sc = 0;
-        if (owned.size > 0) {
-            owned.forEach(function(_, name) {
-                if (sc >= 5) return;
-                samples.push('"' + name + '"');
-                sc++;
-            });
-        }
-        L('Inventory parsing done: appid=' + appid + ', unique items=' + owned.size +
-          ', total count=' + (data.total_inventory_count || 'N/A') +
-          ', samples: ' + samples.join(', '));
 
         return owned;
     }
@@ -260,7 +319,7 @@
                     L('Inventory empty/inaccessible [' + urlFormat + ']: appid=' + appid +
                       ', success=' + (data ? data.success : 'null'));
                     var empty = new Map();
-                    cache[key] = { ts: Date.now(), data: empty };
+                    writeCache(key, empty, sid);
                     return empty;
                 }
 
@@ -271,7 +330,7 @@
 
                 // Check if pagination is needed
                 if (!data.more_items || !data.last_assetid || fetchedSoFar >= totalItems) {
-                    cache[key] = { ts: Date.now(), data: owned };
+                    writeCache(key, owned, sid);
                     return owned;
                 }
 
@@ -313,7 +372,7 @@
 
                 return fetchNextPage(data.last_assetid, owned).then(function(allOwned) {
                     L('[Pagination] complete: appid=' + appid + ', unique items=' + allOwned.size);
-                    cache[key] = { ts: Date.now(), data: allOwned };
+                    writeCache(key, allOwned, sid);
                     return allOwned;
                 });
 
@@ -328,17 +387,16 @@
                     }
                     W('Inventory inaccessible (400) [' + urlFormat + ']: appid=' + appid);
                     var empty400 = new Map();
-                    cache[key] = { ts: Date.now(), data: empty400 };
+                    writeCache(key, empty400, sid);
                     return empty400;
                 }
 
-                // HTTP 5xx — server-side error, cache as empty Map to avoid retries
-                // Note: do NOT return null, or getOwnedCount will trigger json fallback
+                // HTTP 5xx — server-side error; return null to trigger fallback cascade
+                // (json format + context 1), cached so repeated items don't re-fetch
                 if (msg.indexOf('HTTP 5') === 0) {
                     L('Server error [' + urlFormat + ']: appid=' + appid + ', ' + msg);
-                    var empty500 = new Map();
-                    cache[key] = { ts: Date.now(), data: empty500 };
-                    return empty500;
+                    writeCache(key, null, sid);
+                    return null;
                 }
 
                 E('Final failure [' + urlFormat + ']: appid=' + appid + ', ' + msg);
@@ -383,9 +441,10 @@
     // ==================== Inventory Lookup Entry ====================
     /**
      * Games where context 1 returns HTTP 500 (skip context 1 fallback)
-     * 570 = Dota 2, 322330 = Don't Starve Together (DST)
+     * 570 = Dota 2
+     * NOTE: DST (322330) is NOT skipped; its context 1 may work even though context 2 HTTP 500s
      */
-    var SKIP_CONTEXT_1 = { '570': true, '322330': true };
+    var SKIP_CONTEXT_1 = { '570': true };
     /** Track attempted json format fallbacks (avoid triggering per-item) */
     var jsonFallbackDone = {};
 
@@ -412,25 +471,32 @@
         return tryContext(contextId, 'default').then(function(count) {
             if (count > 0) return count;
 
-            // default format completely failed (API down, not just "not found"), try json legacy format
-            // Only try once per appid+context
             var fallbackKey = appid + '_' + contextId;
-            if (count < 0 && !jsonFallbackDone[fallbackKey]) {
-                jsonFallbackDone[fallbackKey] = true;
-                L('[Fallback] default format failed, trying json legacy format: appid=' + appid);
-                return tryContext(contextId, 'json').then(function(c2) {
-                    return c2 > 0 ? c2 : 0;
-                });
+
+            // Try json legacy format when default failed, then try context 1
+            // Both are tried regardless of count value (0 or -1)
+            function tryFallbacks() {
+                if (count < 0 && !jsonFallbackDone[fallbackKey]) {
+                    jsonFallbackDone[fallbackKey] = true;
+                    L('[Fallback] default format failed, trying json legacy format: appid=' + appid);
+                    return tryContext(contextId, 'json').then(function(c2) {
+                        if (c2 > 0) return c2;
+                        return tryCtx1();
+                    });
+                }
+                return tryCtx1();
             }
 
-            // context 1 fallback (only for non-Dota 2 games, and context 2 returned data successfully)
-            if (contextId === '2' && !SKIP_CONTEXT_1[appid] && count >= 0) {
-                return tryContext('1', 'default').then(function(c) {
-                    return c > 0 ? c : 0;
-                });
+            function tryCtx1() {
+                if (contextId === '2' && !SKIP_CONTEXT_1[appid]) {
+                    return tryContext('1', 'default').then(function(c) {
+                        return c > 0 ? c : 0;
+                    });
+                }
+                return 0;
             }
 
-            return 0;
+            return tryFallbacks();
         });
     }
 
@@ -473,21 +539,7 @@
     function processAllRows() {
         var rows = document.querySelectorAll('a.market_listing_row_link');
         L('Found ' + rows.length + ' market items, checking inventory...');
-
-        // Diagnostic: collect involved appids and market hash name samples
-        var appids = {};
-        var samples = [];
-        rows.forEach(function(r) {
-            var info = parseListingURL(r.href);
-            if (info) {
-                appids[info.appid] = true;
-                if (samples.length < 5) {
-                    samples.push(info.appid + ':"' + info.hashName + '"');
-                }
-            }
-            processRow(r);
-        });
-        L('AppIDs: ' + Object.keys(appids).join(',') + ' | Samples: ' + samples.join('; '));
+        rows.forEach(function(r) { processRow(r); });
     }
 
     // ==================== Item Detail Page ====================
@@ -549,24 +601,34 @@
         return 'other';
     }
 
-    // ==================== URL Navigation Watch ====================
-    var lastURL = location.href;
-    setInterval(function() {
-        var cur = location.href;
-        if (cur !== lastURL) {
-            lastURL = cur;
-            setTimeout(function() {
-                setupObserver();
-                if (pageType() === 'browse') processAllRows();
-                else if (pageType() === 'single') processSinglePage();
-            }, 500);
-        }
-    }, 1000);
+    // ==================== Delayed & Stabilized Startup ====================
+    /**
+     * During browser session restore, Steam's auth cookies may be stale,
+     * triggering a redirect chain (market → login → market → ...).
+     * We MUST NOT execute anything during this redirect window.
+     *
+     * Strategy: poll the URL every 250ms. Only when it has been stable
+     * for 800ms AND 2 seconds have passed since DOM ready do we start.
+     * This ensures Steam's auth redirects have fully settled.
+     */
+    var STABLE_DELAY = 800;   // URL must be stable for this long
+    var START_DELAY = 2000;   // Minimum time before starting
+    var CHECK_INTERVAL = 250;  // URL stability check interval
+    var lastCheck = location.href;
+    var stableSince = 0;
+    var domReady = false;
+    var started = false;
 
-    // ==================== Startup ====================
+    function isOnMarket() {
+        return /^\/market(?:\/|$)/.test(location.pathname);
+    }
+
     function init() {
+        if (started) return;
+        started = true;
+
         L('========================================');
-        L('Steam Market Show Owned Items v1.0.0');
+        L('Steam Market Show Owned Items v1.0.1');
         L('========================================');
 
         var sid = getSteamID();
@@ -581,6 +643,7 @@
                 tries++;
                 sid = getSteamID();
                 if (sid) {
+                    loadCacheForSession(sid);
                     L('Current user: ' + sid);
                     start();
                 } else {
@@ -590,22 +653,85 @@
             setTimeout(retry, 500);
             return;
         }
+        loadCacheForSession(sid);
         L('Current user: ' + sid);
         start();
     }
+
+    var lastURL;
 
     function start() {
         setupObserver();
         var pt = pageType();
         L('Page type: ' + pt);
-        if (pt === 'browse') setTimeout(processAllRows, 800);
+        if (pt === 'browse') setTimeout(processAllRows, 400);
         else if (pt === 'single') processSinglePage();
+
+        // Start URL navigation watch (only after stable init)
+        lastURL = location.href;
+        setInterval(function() {
+            var cur = location.href;
+            if (cur !== lastURL) {
+                lastURL = cur;
+                setTimeout(function() {
+                    setupObserver();
+                    if (pageType() === 'browse') processAllRows();
+                    else if (pageType() === 'single') processSinglePage();
+                }, 300);
+            }
+        }, 800);
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
+    function tryStart() {
+        if (!domReady) return;
+
+        var now = Date.now();
+        var curURL = location.href;
+
+        if (curURL !== lastCheck) {
+            lastCheck = curURL;
+            stableSince = now;
+            return;
+        }
+
+        if (now - stableSince < STABLE_DELAY) return;
+
+        // URL is stable, but is it actually a market page?
+        if (!isOnMarket()) {
+            // We're on a non-market page (e.g. stuck on login). Keep polling.
+            return;
+        }
+
+        // All clear — stop polling and start
+        clearInterval(stableTimer);
         init();
+    }
+
+    var stableTimer;
+
+    /** Called on DOM ready — mark domReady and begin stability polling */
+    function onDOMReady() {
+        domReady = true;
+        stableSince = Date.now();
+        lastCheck = location.href;
+
+        // Start polling for URL stability
+        stableTimer = setInterval(tryStart, CHECK_INTERVAL);
+
+        // Also set a one-shot: after START_DELAY, if we somehow haven't started
+        // and the URL is on a market page, force start (belt & suspenders)
+        setTimeout(function() {
+            if (domReady && isOnMarket()) {
+                clearInterval(stableTimer);
+                init();
+            }
+        }, START_DELAY);
+    }
+
+    if (document.readyState === 'interactive' || document.readyState === 'complete') {
+        onDOMReady();
+    } else {
+        document.addEventListener('DOMContentLoaded', onDOMReady);
     }
 
 })();
